@@ -1,0 +1,4 @@
+FILES(main.go)
+FILES(*.go)
+echo $A1
+echo $A4
