@@ -120,7 +120,7 @@ func TestSheet_HasCycles(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			s := NewSheetFromGrid(tt.grid, time.Time{})
-			if got := s.HasCycles(); got != tt.want {
+			if got := s.graph.Validate() != nil; got != tt.want {
 				t.Errorf("Sheet.HasCycles() = %v, want %v", got, tt.want)
 			}
 		})

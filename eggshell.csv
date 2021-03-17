@@ -1,4 +1,7 @@
 FILES(main.go)
 FILES(*.go)
-echo $A1
-echo $A4
+"echo ""$A1"""
+"echo ""$A3"""
+echo $A3 $A4 $A2
+FILES(hufflepuff.txt)
+#echo $A3 $A4 $A2

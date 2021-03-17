@@ -1,14 +1,21 @@
 package main
 
 import (
+	"bytes"
 	"encoding/csv"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"github.com/davecgh/go-spew/spew"
+	"github.com/hashicorp/go-multierror"
+	"github.com/maxmcd/dag"
 )
 
 var (
@@ -20,43 +27,82 @@ type Grid [][]string
 
 type Sheet struct {
 	grid    Grid
-	edges   map[Coordinate][]Coordinate
+	graph   dag.AcyclicGraph
 	files   []Coordinate
 	modTime time.Time
 }
 
-func (s *Sheet) HasCycles() bool {
-	seen := map[Coordinate]struct{}{}
-
-	var hasCycles func(edges []Coordinate) bool
-	hasCycles = func(edges []Coordinate) bool {
-		for _, edge := range edges {
-			if _, ok := seen[edge]; ok {
-				return true
-			}
-			seen[edge] = struct{}{}
-			if hasCycles(s.edges[edge]) {
-				return true
-			}
-		}
-		return false
-	}
-
-	for node, edges := range s.edges {
-		if _, ok := seen[node]; ok {
-			// if we've crawled this graph, skip
-			continue
-		}
-		seen[node] = struct{}{}
-		if hasCycles(edges) {
-			return true
-		}
-	}
-	return false
+func (s *Sheet) AddEdge(a, b Coordinate) {
+	s.graph.Add(a)
+	s.graph.Add(b)
+	s.graph.Connect(dag.BasicEdge(a, b))
 }
 
-func (s *Sheet) AddEdge(a, b Coordinate) {
-	s.edges[a] = append(s.edges[a], b)
+func (s *Sheet) HasCycles() (err error) {
+	// Look for cycles of more than 1 component
+	cycles := s.graph.Cycles()
+	if len(cycles) > 0 {
+		for _, cycle := range cycles {
+			cycleStr := make([]string, len(cycle))
+			for j, vertex := range cycle {
+				cycleStr[j] = dag.VertexName(vertex)
+			}
+
+			err = multierror.Append(err, fmt.Errorf(
+				"Cycle: %s", strings.Join(cycleStr, ", ")))
+		}
+	}
+
+	// Look for cycles to self
+	for _, e := range s.graph.Edges() {
+		if e.Source() == e.Target() {
+			err = multierror.Append(err, fmt.Errorf(
+				"Self reference: %s", dag.VertexName(e.Source())))
+		}
+	}
+	return
+}
+
+func (s *Sheet) Subgraph(a ...Coordinate) (subgraph dag.AcyclicGraph) {
+	if len(a) == 0 {
+		return subgraph
+	}
+	queue := a
+	for {
+		node := queue[0]
+		for _, edge := range s.graph.EdgesTo(node) {
+			subgraph.Add(edge.Source())
+			subgraph.Add(edge.Target())
+			subgraph.Connect(edge)
+			queue = append(queue, edge.Source().(Coordinate))
+		}
+		queue = queue[1:]
+		if len(queue) == 0 {
+			break
+		}
+	}
+
+	// If we have not root (which is common in a spreadsheet) we need to
+	// make a fake one
+	roots := graphRoots(subgraph)
+	if len(roots) > 1 {
+		subgraph.Add(fakeRoot)
+		for _, c := range roots {
+			subgraph.Add(c)
+			subgraph.Connect(dag.BasicEdge(fakeRoot, c))
+		}
+	}
+	return
+}
+
+func graphRoots(g dag.AcyclicGraph) []dag.Vertex {
+	roots := make([]dag.Vertex, 0, 1)
+	for _, v := range g.Vertices() {
+		if g.UpEdges(v).Len() == 0 {
+			roots = append(roots, v)
+		}
+	}
+	return roots
 }
 
 func (s *Sheet) WriteConfig(path string) (err error) {
@@ -74,7 +120,7 @@ func (s *Sheet) cellValue(coo Coordinate) string {
 	defer func() {
 		_ = recover()
 	}()
-	return s.grid[coo[1]][coo[0]]
+	return s.grid[coo[0]][coo[1]]
 }
 
 func (s *Sheet) doesCellContainModifiedFiles(coo Coordinate) bool {
@@ -123,7 +169,6 @@ func NewSheet(path string) (*Sheet, error) {
 
 func NewSheetFromGrid(g Grid, modTime time.Time) *Sheet {
 	s := &Sheet{
-		edges:   map[Coordinate][]Coordinate{},
 		grid:    g,
 		modTime: modTime,
 	}
@@ -132,7 +177,7 @@ func NewSheetFromGrid(g Grid, modTime time.Time) *Sheet {
 			coordinates := CoordinatesInCell(val)
 			for _, coo := range coordinates {
 				// Add link from the source cell to the cell referencing the value
-				s.AddEdge(coo, Coordinate{x, y})
+				s.AddEdge(Coordinate{x, y}, coo)
 			}
 			if filesMatch.MatchString(strings.TrimSpace(val)) {
 				s.files = append(s.files, Coordinate{x, y})
@@ -144,7 +189,15 @@ func NewSheetFromGrid(g Grid, modTime time.Time) *Sheet {
 
 func CoordinatesInCell(cell string) []Coordinate {
 	out := []Coordinate{}
-	os.Expand(cell, func(v string) string {
+	Expand(cell, func(coo Coordinate) string {
+		out = append(out, coo)
+		return ""
+	})
+	return out
+}
+
+func Expand(cell string, fn func(Coordinate) string) string {
+	return os.Expand(cell, func(v string) string {
 		for _, matches := range coordinateMatch.FindAllStringSubmatch(v, -1) {
 			xString, yString := matches[2], matches[1]
 			num, err := strconv.Atoi(xString)
@@ -159,11 +212,11 @@ func CoordinatesInCell(cell string) []Coordinate {
 			if x < 0 {
 				return "" // don't support $A0
 			}
-			out = append(out, Coordinate{x, columnNameToIndex(yString)})
+			coo := Coordinate{x, columnNameToIndex(yString)}
+			return fn(coo)
 		}
 		return ""
 	})
-	return out
 }
 
 type Coordinate [2]int
@@ -196,24 +249,77 @@ func columnIndexToColumnName(num int) string {
 	return columnName
 }
 
-func main() {
+var fakeRoot = Coordinate{-1, -1}
+
+func run() (err error) {
 	dataLocation := "./eggshell.csv"
 	sheet, err := NewSheet(dataLocation)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err.Error())
-		os.Exit(1)
+		return err
+	}
+	if err := sheet.HasCycles(); err != nil {
+		return err
 	}
 	newFiles := sheet.NewFiles()
 	if newFiles == nil {
 		return
 	}
-	if sheet.HasCycles() {
-		fmt.Fprintln(os.Stderr, "graph has circular references")
+
+	sheet.grid[3][0] = "echo \"$A3\""
+
+	toRun := sheet.Subgraph(newFiles...)
+	outputs := map[Coordinate]string{}
+	lock := sync.Mutex{}
+	errs := toRun.Walk(func(v dag.Vertex) error {
+		coo := v.(Coordinate)
+		if coo == fakeRoot {
+			return nil
+		}
+		value := sheet.cellValue(coo)
+		if filesMatch.MatchString(value) {
+			files, _ := filepath.Glob(filesMatch.FindAllStringSubmatch(value, 1)[0][1])
+			lock.Lock()
+			outputs[coo] = strings.Join(files, " ")
+			lock.Unlock()
+			return nil
+		}
+		spew.Dump(value)
+		cmd := exec.Command("bash", "-c", value)
+		var buf bytes.Buffer
+		var stderr bytes.Buffer
+		cmd.Stdout = &buf
+		cmd.Stderr = &stderr
+
+		cmd.Env = os.Environ()
+
+		coos := CoordinatesInCell(value)
+		for _, coo := range coos {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", coo, outputs[coo]))
+		}
+		if err := cmd.Run(); err != nil {
+			fmt.Println(stderr.String())
+			return err
+		}
+
+		fmt.Println(buf.String())
+		lock.Lock()
+		outputs[coo] = buf.String()
+		lock.Unlock()
+		return nil
+	})
+	spew.Dump(outputs)
+	_ = errs
+	// for _, err := range errs {
+	// 	fmt.Println(err)
+	// }
+	// if len(errs) > 0 {
+	// 	return errors.New("errors running")
+	// }
+	return sheet.WriteConfig(dataLocation)
+}
+func main() {
+	if err := run(); err != nil {
+		fmt.Fprintln(os.Stderr, err.Error())
 		os.Exit(1)
 	}
-
-	for _, coo := range newFiles {
-
-	}
-	_ = sheet.WriteConfig(dataLocation)
 }
