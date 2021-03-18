@@ -2,8 +2,10 @@ package main
 
 import (
 	"bytes"
+
 	"encoding/csv"
 	"fmt"
+	"log"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -13,7 +15,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
 	"github.com/hashicorp/go-multierror"
 	"github.com/maxmcd/dag"
 )
@@ -36,6 +37,10 @@ func (s *Sheet) AddEdge(a, b Coordinate) {
 	s.graph.Add(a)
 	s.graph.Add(b)
 	s.graph.Connect(dag.BasicEdge(a, b))
+}
+
+func (s *Sheet) UpdateCell(row, column int, value string) {
+	fmt.Println(s.cellValue(Coordinate{row, column}))
 }
 
 func (s *Sheet) HasCycles() (err error) {
@@ -113,7 +118,19 @@ func (s *Sheet) WriteConfig(path string) (err error) {
 	defer f.Close()
 	writer := csv.NewWriter(f)
 	defer writer.Flush()
+	s.quoteEmptyStrings()
 	return writer.WriteAll(s.grid)
+}
+
+// https://github.com/golang/go/issues/39119
+func (s *Sheet) quoteEmptyStrings() {
+	for i, row := range s.grid {
+		for j, cell := range row {
+			if cell == "" {
+				s.grid[i][j] = `""`
+			}
+		}
+	}
 }
 
 func (s *Sheet) cellValue(coo Coordinate) string {
@@ -257,6 +274,8 @@ func run() (err error) {
 	if err != nil {
 		return err
 	}
+
+	log.Fatal(sheet.RunServer(":8080"))
 	if err := sheet.HasCycles(); err != nil {
 		return err
 	}
@@ -283,7 +302,6 @@ func run() (err error) {
 			lock.Unlock()
 			return nil
 		}
-		spew.Dump(value)
 		cmd := exec.Command("bash", "-c", value)
 		var buf bytes.Buffer
 		var stderr bytes.Buffer
@@ -307,7 +325,6 @@ func run() (err error) {
 		lock.Unlock()
 		return nil
 	})
-	spew.Dump(outputs)
 	_ = errs
 	// for _, err := range errs {
 	// 	fmt.Println(err)

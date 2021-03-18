@@ -1,7 +1,8 @@
-FILES(main.go)
-FILES(*.go)
-"echo ""$A1"""
-"echo ""$A3"""
-echo $A3 $A4 $A2
-FILES(hufflepuff.txt)
-#echo $A3 $A4 $A2
+FILES(main.go),""""""
+FILES(*.go),""""""
+"echo ""$A1""",""""""
+"""""",""""""
+asdasdf,""""""
+"echo $A3 $A4 $A2
+curl google.com",""""""
+"echo ""$A2""",""""""

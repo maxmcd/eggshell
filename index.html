@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=edge" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>eggshell</title>
+    <script src="https://cdn.jsdelivr.net/npm/handsontable@8.3.2/dist/handsontable.full.min.js"></script>
+    <link
+      href="https://cdn.jsdelivr.net/npm/handsontable@8.3.2/dist/handsontable.full.min.css"
+      rel="stylesheet"
+      media="screen"
+    />
+    <link
+      rel="stylesheet"
+      href="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@10.6.0/build/styles/default.min.css"
+    />
+    <script src="//cdn.jsdelivr.net/gh/highlightjs/cdn-release@10.6.0/build/highlight.min.js"></script>
+    <link
+      rel="stylesheet"
+      type="text/css"
+      href="https://cdn.jsdelivr.net/npm/toastify-js/src/toastify.min.css"
+    />
+    <script
+      type="text/javascript"
+      src="https://cdn.jsdelivr.net/npm/toastify-js"
+    ></script>
+    <style>
+      body {
+        font-family: "Courier New", Courier, monospace;
+        margin: 0px;
+      }
+      #main {
+        width: 100%;
+        height: 100%;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="main"></div>
+    <script>
+      function syntaxRenderer(
+        instance,
+        td,
+        row,
+        col,
+        prop,
+        value,
+        cellProperties
+      ) {
+        if (!value) {
+          td.innerHTML = "";
+          return;
+        }
+        td.innerHTML = hljs.highlight("bash", value).value;
+      }
+      function warn(text) {
+        Toastify({
+          text,
+          backgroundColor: "linear-gradient(to right, #cb2d3e, #ef473a)",
+        }).showToast();
+      }
+      async function start() {
+        const response = await fetch("/data.json");
+        const body = await response.json();
+        var hot;
+        var container = document.getElementById("main");
+        const config = {
+          data: body.map((row) =>
+            row.map((cell) => (cell == '""' ? "" : cell))
+          ),
+          renderer: syntaxRenderer,
+          rowHeaders: true,
+          colHeaders: true,
+          dropdownMenu: true,
+          manualRowResize: true,
+          manualColumnResize: true,
+          manualRowMove: true,
+          manualColumnMove: true,
+          contextMenu: true,
+          afterChange: async function (changes) {
+            if (!changes) return;
+            console.log(changes);
+            const resp = await fetch("/change", {
+              method: "POST",
+              body: JSON.stringify(
+                changes.map((change) => ({
+                  Row: change[0],
+                  Column: change[1],
+                  OldValue: change[2],
+                  NewValue: change[3],
+                }))
+              ),
+              headers: { "Content-Type": "application/json" },
+            });
+            if (!resp.ok) {
+              warn("failed to change");
+            }
+          },
+          licenseKey: "non-commercial-and-evaluation",
+        };
+        async function afterMajorChange(e) {
+          const resp = await fetch("/update", {
+            method: "POST",
+            body: JSON.stringify(hot.getData()),
+            headers: { "Content-Type": "application/json" },
+          });
+          if (!resp.ok) {
+            warn("failed to change");
+          }
+        }
+        [
+          "afterCreateCol",
+          "afterCreateRow",
+          "afterRemoveCol",
+          "afterRemoveRow",
+        ].forEach((n) => {
+          config[n] = afterMajorChange;
+        });
+        hot = new Handsontable(container, config);
+      }
+      start();
+    </script>
+  </body>
+</html>
