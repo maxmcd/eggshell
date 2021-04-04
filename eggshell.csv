@@ -1,8 +1,7 @@
 FILES(main.go),""""""
 FILES(*.go),""""""
 "echo ""$A1""",""""""
-"""""",""""""
+go build -o eggshell $A2,""""""
 asdasdf,""""""
-"echo $A3 $A4 $A2
-curl google.com",""""""
+echo $A3 $A4 $A2,""""""
 "echo ""$A2""",""""""

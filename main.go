@@ -2,12 +2,16 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"io"
+	"math/rand"
+	"syscall"
 
 	"encoding/csv"
 	"fmt"
-	"log"
 	"os"
 	"os/exec"
+	"os/signal"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -15,7 +19,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/charmbracelet/lipgloss"
 	"github.com/hashicorp/go-multierror"
+	"github.com/koron-go/prefixw"
 	"github.com/maxmcd/dag"
 )
 
@@ -27,20 +33,18 @@ var (
 type Grid [][]string
 
 type Sheet struct {
-	grid    Grid
-	graph   dag.AcyclicGraph
-	files   []Coordinate
-	modTime time.Time
+	grid      Grid
+	graph     dag.AcyclicGraph
+	files     []Coordinate
+	modTime   time.Time
+	buildLock sync.Mutex
+	building  bool
 }
 
 func (s *Sheet) AddEdge(a, b Coordinate) {
 	s.graph.Add(a)
 	s.graph.Add(b)
 	s.graph.Connect(dag.BasicEdge(a, b))
-}
-
-func (s *Sheet) UpdateCell(row, column int, value string) {
-	fmt.Println(s.cellValue(Coordinate{row, column}))
 }
 
 func (s *Sheet) HasCycles() (err error) {
@@ -165,6 +169,86 @@ func (s *Sheet) NewFiles() []Coordinate {
 	return out
 }
 
+var fakeRoot = Coordinate{-1, -1}
+
+func (s *Sheet) RunScriptsIfChanged(dataLocation string) (err error) {
+	if s.building {
+		return
+	}
+	s.buildLock.Lock()
+	s.building = true
+	defer func() {
+		s.building = false
+		s.buildLock.Unlock()
+	}()
+
+	if err := s.HasCycles(); err != nil {
+		return err
+	}
+	newFiles := s.NewFiles()
+	if len(newFiles) == 0 {
+		return
+	}
+
+	fmt.Println(lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("#FAFAFA")).Background(lipgloss.Color("#8360c3")).Width(80).Render("Running..."))
+	defer fmt.Println(lipgloss.NewStyle().Bold(false).Foreground(lipgloss.Color("#FAFAFA")).Background(lipgloss.Color("#2ebf91")).Width(80).Render("Complete!"))
+
+	colors := []string{"#7B69BE", "#7471BA", "#6C7AB5", "#6483B1", "#5C8BAC", "#5594A8", "#4D9CA3", "#45A59F", "#3DAE9A", "#36B696"}
+
+	toRun := s.Subgraph(newFiles...)
+	outputs := map[Coordinate]string{}
+	lock := sync.Mutex{}
+	errs := toRun.Walk(func(v dag.Vertex) error {
+		coo := v.(Coordinate)
+		if coo == fakeRoot {
+			return nil
+		}
+		value := s.cellValue(coo)
+		if filesMatch.MatchString(value) {
+			files, _ := filepath.Glob(filesMatch.FindAllStringSubmatch(value, 1)[0][1])
+			lock.Lock()
+			outputs[coo] = strings.Join(files, " ")
+			lock.Unlock()
+			return nil
+		}
+
+		style := lipgloss.NewStyle().
+			Bold(true).
+			Foreground(lipgloss.Color("#FAFAFA")).
+			Background(lipgloss.Color(colors[rand.Intn(len(colors)-1)])).PaddingLeft(1).PaddingRight(1)
+
+		cmd := exec.Command("bash", "-c", value)
+		var stdoutBuf bytes.Buffer
+		var stderrBuf bytes.Buffer
+		stdoutWriter := io.MultiWriter(&stdoutBuf, prefixw.New(os.Stdout, style.Render(coo.String())+" "))
+		cmd.Stdout = stdoutWriter
+		cmd.Stderr = io.MultiWriter(&stderrBuf, prefixw.New(os.Stderr, style.Render(coo.String())+" "))
+		cmd.Stdin = nil
+		cmd.Env = os.Environ()
+
+		fmt.Fprintln(stdoutWriter, value)
+
+		coos := CoordinatesInCell(value)
+		for _, coo := range coos {
+			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", coo, outputs[coo]))
+		}
+		if err := cmd.Run(); err != nil {
+			fmt.Println(stderrBuf.String())
+			return err
+		}
+
+		lock.Lock()
+		outputs[coo] = stdoutBuf.String()
+		lock.Unlock()
+		return nil
+	})
+	s.modTime = time.Now()
+	if len(errs) == 0 {
+		return nil
+	}
+	return multierror.Append(err, errs...)
+}
+
 func NewSheet(path string) (*Sheet, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -230,6 +314,8 @@ func Expand(cell string, fn func(Coordinate) string) string {
 				return "" // don't support $A0
 			}
 			coo := Coordinate{x, columnNameToIndex(yString)}
+
+			// we only expect one match, so we can just return
 			return fn(coo)
 		}
 		return ""
@@ -266,73 +352,43 @@ func columnIndexToColumnName(num int) string {
 	return columnName
 }
 
-var fakeRoot = Coordinate{-1, -1}
+func interruptContext() context.Context {
+	c := make(chan os.Signal)
+	signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-c
+		cancel()
+	}()
+	return ctx
+}
 
 func run() (err error) {
+	ctx := interruptContext()
 	dataLocation := "./eggshell.csv"
 	sheet, err := NewSheet(dataLocation)
 	if err != nil {
 		return err
 	}
 
-	log.Fatal(sheet.RunServer(":8080"))
-	if err := sheet.HasCycles(); err != nil {
-		return err
+	onChange := make(chan struct{})
+	// Start the server that serves the spreadsheet
+	sheet.RunServer(ctx, onChange, ":8080")
+
+	t := time.NewTicker(time.Second * 5)
+	for {
+		select {
+		case <-t.C:
+			err = sheet.RunScriptsIfChanged(dataLocation)
+		case <-onChange:
+			err = sheet.RunScriptsIfChanged(dataLocation)
+		case <-ctx.Done():
+			return sheet.WriteConfig(dataLocation)
+		}
+		if err != nil {
+			fmt.Println(err.Error())
+		}
 	}
-	newFiles := sheet.NewFiles()
-	if newFiles == nil {
-		return
-	}
-
-	sheet.grid[3][0] = "echo \"$A3\""
-
-	toRun := sheet.Subgraph(newFiles...)
-	outputs := map[Coordinate]string{}
-	lock := sync.Mutex{}
-	errs := toRun.Walk(func(v dag.Vertex) error {
-		coo := v.(Coordinate)
-		if coo == fakeRoot {
-			return nil
-		}
-		value := sheet.cellValue(coo)
-		if filesMatch.MatchString(value) {
-			files, _ := filepath.Glob(filesMatch.FindAllStringSubmatch(value, 1)[0][1])
-			lock.Lock()
-			outputs[coo] = strings.Join(files, " ")
-			lock.Unlock()
-			return nil
-		}
-		cmd := exec.Command("bash", "-c", value)
-		var buf bytes.Buffer
-		var stderr bytes.Buffer
-		cmd.Stdout = &buf
-		cmd.Stderr = &stderr
-
-		cmd.Env = os.Environ()
-
-		coos := CoordinatesInCell(value)
-		for _, coo := range coos {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("%s=%s", coo, outputs[coo]))
-		}
-		if err := cmd.Run(); err != nil {
-			fmt.Println(stderr.String())
-			return err
-		}
-
-		fmt.Println(buf.String())
-		lock.Lock()
-		outputs[coo] = buf.String()
-		lock.Unlock()
-		return nil
-	})
-	_ = errs
-	// for _, err := range errs {
-	// 	fmt.Println(err)
-	// }
-	// if len(errs) > 0 {
-	// 	return errors.New("errors running")
-	// }
-	return sheet.WriteConfig(dataLocation)
 }
 func main() {
 	if err := run(); err != nil {
